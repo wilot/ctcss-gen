@@ -1,0 +1,14 @@
+[build]
+target = "avr-none"
+rustflags = ["-C", "target-cpu=atmega328p"]
+
+[env]
+# If you're running the bare chip at 8 MHz internal RC instead of 16 MHz crystal,
+# change this to 8000000.
+AVR_CPU_FREQUENCY_HZ = "16000000"
+
+[target.'cfg(target_arch = "avr")']
+runner = "avrdude -p atmega328p -c stk500v2 -U flash:w:{}"
+
+[unstable]
+build-std = ["core"]

@@ -1,0 +1,26 @@
+[package]
+name = "ctcss-gen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avr-device  = { version = "0.8.1", features = ["atmega328p", "rt"] }
+atmega-hal = { version = "0.1.0", features = ["atmega328p"], path = "../avr-hal/mcu/atmega-hal" }
+panic-halt  = "1"
+ufmt         = "0.2.0"
+embedded-graphics = "0.8.2"
+embedded-hal      = "1.0.0"
+
+# SSD1315 driver (SSD1306-compatible, implements DrawTarget)
+ssd1315 = "0.2.3"
+
+[profile.dev]
+panic   = "abort"
+opt-level = "s"       # small binary even in dev
+lto     = true
+
+[profile.release]
+panic   = "abort"
+opt-level = "s"
+lto     = true
+strip   = true
