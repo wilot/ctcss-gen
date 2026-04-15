@@ -10,9 +10,7 @@ panic-halt  = "1"
 ufmt         = "0.2.0"
 embedded-graphics = "0.8.2"
 embedded-hal      = "1.0.0"
-
-# SSD1315 driver (SSD1306-compatible, implements DrawTarget)
-ssd1315 = "0.2.3"
+ssd1306 = "0.10.0"
 
 [profile.dev]
 panic   = "abort"
