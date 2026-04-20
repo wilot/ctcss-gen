@@ -2,7 +2,6 @@
 #![no_main]
 #![feature(abi_avr_interrupt)]
 
-// ──────────────────────────────────────────────
 //  CTCSS Tone Generator for Yaesu FT-480R
 //
 //  Hardware:
@@ -20,32 +19,23 @@
 //  Tone output (0 V – 5 V square from OC1A) must be attenuated
 //  to ≤ 0.35 Vpp with a resistive divider before injecting into
 //  the FT-480R tone socket.
-// ──────────��───────────────────────────────────
 
-use atmega_hal::prelude::*;
 use avr_device::atmega328p::TC1;
 use core::cell;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use panic_halt as _;
 
-use embedded_graphics::{
-    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10, ascii::FONT_10X20},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
-};
+use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
-// ── Changed: ssd1306 I2C imports instead of ssd1315 SPI ──
-use ssd1306::{I2CDisplayInterface, Ssd1306, mode::BufferedGraphicsMode, prelude::*};
-
-// ── Standard CTCSS tone table (EIA/TIA) ──────────────────────
+// Standard CTCSS tone table (EIA/TIA)
 const CTCSS_TONES: [u16; 50] = [
     670, 693, 719, 744, 770, 797, 825, 854, 885, 915, 948, 974, 1000, 1035, 1072, 1109, 1148, 1188,
     1230, 1273, 1318, 1365, 1413, 1462, 1514, 1567, 1622, 1679, 1738, 1799, 1862, 1928, 1966, 2035,
     2065, 2107, 2181, 2257, 2291, 2336, 2418, 2503, 2541, 2591, 2642, 2693, 2744, 2797, 2851, 2999,
 ];
 
-// ── Shared state (interrupt ↔ main loop) ─────────────────────
+// Shared state (interrupts & main loop)
 static ENCODER_DELTA: avr_device::interrupt::Mutex<cell::Cell<i8>> =
     avr_device::interrupt::Mutex::new(cell::Cell::new(0));
 
@@ -55,7 +45,7 @@ static BTN_TOGGLE_PRESSED: AtomicBool = AtomicBool::new(false);
 static MILLIS_CTR: avr_device::interrupt::Mutex<cell::Cell<u32>> =
     avr_device::interrupt::Mutex::new(cell::Cell::new(0));
 
-// ── Helpers (unchanged) ──────────────────────────────────────
+// Helper functions
 
 fn millis() -> u32 {
     avr_device::interrupt::free(|cs| MILLIS_CTR.borrow(cs).get())
@@ -70,7 +60,7 @@ fn take_encoder_delta() -> i8 {
     })
 }
 
-// ── Timer 1 — tone generation (unchanged) ────────────────────
+// Timer 1 — tone generation
 
 const F_CPU: u32 = 16_000_000;
 const PRESCALER: u32 = 8;
@@ -95,7 +85,7 @@ fn stop_tone(tc1: &TC1) {
     tc1.tccr1a().write(|w| w.com1a().disconnected());
 }
 
-// ── Millis timer (unchanged) ─────────────────────────────────
+// Millis timer (Timer 0)
 
 fn millis_init(tc0: atmega_hal::pac::TC0) {
     tc0.tccr0a().write(|w| w.wgm0().ctc());
@@ -112,7 +102,7 @@ fn TIMER0_COMPA() {
     });
 }
 
-// ── Rotary encoder ISR (unchanged) ───────────────────────────
+// Rotary encoder ISR
 
 static mut LAST_ENC: u8 = 0;
 
@@ -123,7 +113,7 @@ fn encoder_init(exint: &atmega_hal::pac::EXINT) {
 
 #[avr_device::interrupt(atmega328p)]
 fn PCINT2() {
-    let pind = unsafe { (*avr_device::atmega328p::PORTD::ptr()).pin().read().bits() };
+    let pind = unsafe { (*atmega_hal::pac::PORTD::ptr()).pind().read().bits() };
     let a = (pind >> 2) & 1;
     let b = (pind >> 3) & 1;
     let enc = (a << 1) | b;
@@ -152,7 +142,7 @@ fn PCINT2() {
     }
 }
 
-// ── Display helpers (unchanged) ──────────────────────────────
+// Display helper
 
 fn fmt_dhz(buf: &mut [u8; 8], dhz: u16) -> usize {
     let whole = dhz / 10;
@@ -190,17 +180,17 @@ fn fmt_dhz(buf: &mut [u8; 8], dhz: u16) -> usize {
     out
 }
 
-// ── Clock type for I2C speed calculation ─────────────────────
+// Clock type for I2C speed calculation
 type CoreClock = atmega_hal::clock::MHz8;
 type I2c = atmega_hal::i2c::I2c<CoreClock>;
 
-// ── Entry point ──────────────────────────────────────────────
+// Entry point
 #[avr_device::entry]
 fn main() -> ! {
     let dp = atmega_hal::Peripherals::take().unwrap();
     let pins = atmega_hal::pins!(dp);
 
-    // ── I2C bus for OLED (replaces entire SPI block) ─────────
+    // I2C bus for OLED
     //  SDA = PC4,  SCL = PC5  (ATmega328P TWI hardware)
     let i2c = I2c::new(
         dp.TWI,
@@ -209,22 +199,23 @@ fn main() -> ! {
         400_000,                       // 400 kHz Fast-mode
     );
 
-    // Build I2C display interface → ssd1306 driver in buffered graphics mode
+    // Build I2C display interface → ssd1306 driver in terminal graphics mode
     let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
+    let mut display =
+        Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
     display.init().unwrap();
+    display.clear().unwrap();
 
-    // ── Tone output pin (unchanged) ──────────────────────────
+    // Tone output pin
     let _tone_pin = pins.pb1.into_output();
 
-    // ── Encoder + buttons (unchanged) ────────────────────────
+    // Encoder + buttons
     let _enc_a = pins.pd2.into_pull_up_input();
     let _enc_b = pins.pd3.into_pull_up_input();
     let btn_sel = pins.pd4.into_pull_up_input();
     let btn_tog = pins.pd7.into_pull_up_input();
 
-    // ── Timers (unchanged) ───────────────────────────────────
+    // Timers setup
     millis_init(dp.TC0);
     encoder_init(&dp.EXINT);
 
@@ -234,7 +225,7 @@ fn main() -> ! {
         avr_device::interrupt::enable();
     }
 
-    // ── Application state (unchanged) ────────────────────────
+    // Application state
     let mut tone_index: usize = 12;
     let mut output_on = false;
     let mut last_btn_sel = true;
@@ -244,7 +235,7 @@ fn main() -> ! {
 
     stop_tone(&tc1);
 
-    // ── Main loop ────────────────────────────────────────────
+    // Main loop
     loop {
         let now = millis();
 
@@ -280,45 +271,24 @@ fn main() -> ! {
         last_btn_tog = tog_now;
 
         if needs_redraw && now.wrapping_sub(last_render) >= 80 {
-            needs_redraw = false;
-            last_render = now;
+            display.clear().unwrap();
+            display.set_position(4, 0).unwrap();
+            write!(display, "  CTCSS Tone  ").ok();
 
             let mut fbuf = [0u8; 8];
             let flen = fmt_dhz(&mut fbuf, CTCSS_TONES[tone_index]);
             let freq_str = core::str::from_utf8(&fbuf[..flen]).unwrap_or("???");
+            display.set_position(3, 3).unwrap();
+            write!(display, "{}", freq_str).ok();
 
-            let big_style = MonoTextStyleBuilder::new()
-                .font(&FONT_10X20)
-                .text_color(BinaryColor::On)
-                .build();
-            let small_style = MonoTextStyleBuilder::new()
-                .font(&FONT_6X10)
-                .text_color(BinaryColor::On)
-                .build();
-
-            // ── Changed: ssd1306 clear + flush API ───────────
-            display.clear_buffer();
-
-            Text::with_baseline("CTCSS Tone", Point::new(16, 0), small_style, Baseline::Top)
-                .draw(&mut display)
-                .ok();
-
-            Text::with_baseline(freq_str, Point::new(14, 24), big_style, Baseline::Top)
-                .draw(&mut display)
-                .ok();
-
+            // Row 6 – output status
             let status = if output_on {
                 ">> OUTPUT ON <<"
             } else {
-                "   output off  "
+                "  output off   "
             };
-            Text::with_baseline(status, Point::new(10, 52), small_style, Baseline::Top)
-                .draw(&mut display)
-                .ok();
-
-            display.flush().unwrap();
+            display.set_position(3, 6).unwrap();
+            write!(display, "{}", status).ok();
         }
-
-        delay_ms(2);
     }
 }
