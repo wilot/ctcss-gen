@@ -20,11 +20,13 @@
 //  to ≤ 0.35 Vpp with a resistive divider before injecting into
 //  the FT-480R tone socket.
 
-use avr_device::atmega328p::TC1;
-use core::cell;
+use core::cell::Cell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use panic_halt as _;
+
+use avr_device::atmega328p::TC1;
+use avr_device::interrupt::Mutex;
 
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
@@ -36,14 +38,12 @@ const CTCSS_TONES: [u16; 50] = [
 ];
 
 // Shared state (interrupts & main loop)
-static ENCODER_DELTA: avr_device::interrupt::Mutex<cell::Cell<i8>> =
-    avr_device::interrupt::Mutex::new(cell::Cell::new(0));
+static ENCODER_DELTA: Mutex<Cell<i8>> = Mutex::new(Cell::new(0));
 
 static BTN_SELECT_PRESSED: AtomicBool = AtomicBool::new(false);
 static BTN_TOGGLE_PRESSED: AtomicBool = AtomicBool::new(false);
 
-static MILLIS_CTR: avr_device::interrupt::Mutex<cell::Cell<u32>> =
-    avr_device::interrupt::Mutex::new(cell::Cell::new(0));
+static MILLIS_CTR: Mutex<Cell<u32>> = Mutex::new(Cell::new(0));
 
 // Helper functions
 
@@ -70,7 +70,13 @@ const fn ocr_for_dhz(freq_dhz: u32) -> u16 {
     top as u16
 }
 
+/// Configures TC1 peripheral
 fn set_tone_frequency(tc1: &TC1, freq_dhz: u16) {
+    // Sets to CTC mode (WGM1 bits to 0100)
+    // Sets OC1A pin to toggle on compare match
+    // Sets clock source to CLK-IO/8
+    // Sets OCR1A to the calculated value
+    // Sets the timer value to zero
     let ocr = ocr_for_dhz(freq_dhz as u32);
     tc1.tccr1a()
         .write(|w| w.com1a().match_toggle().wgm1().set(0b00));
@@ -80,14 +86,19 @@ fn set_tone_frequency(tc1: &TC1, freq_dhz: u16) {
     tc1.tcnt1().write(|w| w.set(0));
 }
 
+/// Stops the TC1 peripheral
 fn stop_tone(tc1: &TC1) {
+    // Stops the clock source and disconnects OC1A pin
     tc1.tccr1b().write(|w| w.cs1().no_clock());
     tc1.tccr1a().write(|w| w.com1a().disconnected());
 }
 
-// Millis timer (Timer 0)
-
+/// Initialises millis on timer 0
 fn millis_init(tc0: atmega_hal::pac::TC0) {
+    // Sets CTC (clear timer on compare) mode
+    // Sets the output compare register (OCR0A)
+    // Sets the clock source to CLK-IO/64
+    // Enables interrupt on output-compare match
     tc0.tccr0a().write(|w| w.wgm0().ctc());
     tc0.ocr0a().write(|w| w.set(249u8));
     tc0.tccr0b().write(|w| w.cs0().prescale_64());
@@ -96,6 +107,8 @@ fn millis_init(tc0: atmega_hal::pac::TC0) {
 
 #[avr_device::interrupt(atmega328p)]
 fn TIMER0_COMPA() {
+    // Timer 0 Compare A interrupt
+    // Updates the millisecond counter
     avr_device::interrupt::free(|cs| {
         let c = MILLIS_CTR.borrow(cs);
         c.set(c.get().wrapping_add(1));
@@ -107,12 +120,15 @@ fn TIMER0_COMPA() {
 static mut LAST_ENC: u8 = 0;
 
 fn encoder_init(exint: &atmega_hal::pac::EXINT) {
+    // Sets pin change interrupt 2 enable
     exint.pcicr().write(|w| unsafe { w.bits(0b100) });
     exint.pcmsk2().write(|w| unsafe { w.bits(0b0000_1100) });
 }
 
 #[avr_device::interrupt(atmega328p)]
 fn PCINT2() {
+    // Pin change 2 interrupt
+    // Read state of rotary encoder pins
     let pind = unsafe { (*atmega_hal::pac::PORTD::ptr()).pind().read().bits() };
     let a = (pind >> 2) & 1;
     let b = (pind >> 3) & 1;
@@ -143,7 +159,6 @@ fn PCINT2() {
 }
 
 // Display helper
-
 fn fmt_dhz(buf: &mut [u8; 8], dhz: u16) -> usize {
     let whole = dhz / 10;
     let frac = dhz % 10;
@@ -181,7 +196,8 @@ fn fmt_dhz(buf: &mut [u8; 8], dhz: u16) -> usize {
 }
 
 // Clock type for I2C speed calculation
-type CoreClock = atmega_hal::clock::MHz8;
+// TODO: Check clock speed
+type CoreClock = atmega_hal::clock::MHz16;
 type I2c = atmega_hal::i2c::I2c<CoreClock>;
 
 // Entry point
