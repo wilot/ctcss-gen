@@ -25,8 +25,17 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use panic_halt as _;
 
+use atmega_hal::usart::Baudrate;
+use atmega_hal::usart::Usart;
 use avr_device::atmega328p::TC1;
 use avr_device::interrupt::Mutex;
+
+use embedded_graphics::{
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::{Baseline, Text},
+};
 
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
@@ -206,21 +215,47 @@ fn main() -> ! {
     let dp = atmega_hal::Peripherals::take().unwrap();
     let pins = atmega_hal::pins!(dp);
 
+    let mut serial = Usart::new(
+        dp.USART0,
+        pins.pd0,               // Rx
+        pins.pd1.into_output(), // Tx
+        Baudrate::<CoreClock>::new(115200),
+    );
+
+    ufmt::uwriteln!(&mut serial, "Booting").unwrap();
+
     // I2C bus for OLED
     //  SDA = PC4,  SCL = PC5  (ATmega328P TWI hardware)
-    let i2c = I2c::new(
+    let mut i2c = I2c::new(
         dp.TWI,
         pins.pc4.into_pull_up_input(), // SDA
         pins.pc5.into_pull_up_input(), // SCL
         400_000,                       // 400 kHz Fast-mode
     );
 
+    ufmt::uwriteln!(&mut serial, "I2C defined").unwrap();
+
     // Build I2C display interface → ssd1306 driver in terminal graphics mode
     let interface = I2CDisplayInterface::new(i2c);
     let mut display =
         Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
-    display.init().unwrap();
-    display.clear().unwrap();
+    let r = display.init();
+    ufmt::uwriteln!(&mut serial, "display.init={:?}", r.is_ok()).ok();
+    let r = display.clear();
+    ufmt::uwriteln!(&mut serial, "display.clear={:?}", r.is_ok()).ok();
+    ufmt::uwriteln!(&mut serial, "display.dimensions={:?}", display.dimensions()).ok();
+    display.set_position(0, 0).ok();
+    for c in "STARTUP".chars() {
+        // Writing strings doesn't work but individual chars is ok???
+        display.write_char(c);
+    }
+    // let r = display.write_str("STARTUP");
+    //ufmt::uwriteln!(&mut serial, "display.write_str={:?}", r.is_ok());
+    //display.write_char('a');
+    //display.write_char('b');
+    //display.write_char('c');
+    ufmt::uwriteln!(&mut serial, "Display initialised").ok();
+    loop {}
 
     // Tone output pin
     let _tone_pin = pins.pb1.into_output();
@@ -235,11 +270,15 @@ fn main() -> ! {
     millis_init(dp.TC0);
     encoder_init(&dp.EXINT);
 
+    ufmt::uwriteln!(&mut serial, "Timers and encoder initialised").unwrap();
+
     let tc1 = dp.TC1;
 
     unsafe {
         avr_device::interrupt::enable();
     }
+
+    ufmt::uwriteln!(&mut serial, "Interrupts enabled").unwrap();
 
     // Application state
     let mut tone_index: usize = 12;
@@ -257,6 +296,7 @@ fn main() -> ! {
 
         let delta = take_encoder_delta();
         if delta != 0 {
+            ufmt::uwriteln!(&mut serial, "Updating tone").unwrap();
             let new_idx = (tone_index as i16 + delta as i16)
                 .clamp(0, (CTCSS_TONES.len() - 1) as i16) as usize;
             if new_idx != tone_index {
@@ -270,12 +310,14 @@ fn main() -> ! {
 
         let sel_now = btn_sel.is_high();
         if last_btn_sel && !sel_now {
+            ufmt::uwriteln!(&mut serial, "Select pressed").unwrap();
             BTN_SELECT_PRESSED.store(true, Ordering::SeqCst);
         }
         last_btn_sel = sel_now;
 
         let tog_now = btn_tog.is_high();
         if last_btn_tog && !tog_now {
+            ufmt::uwriteln!(&mut serial, "Output toggle").unwrap();
             output_on = !output_on;
             if output_on {
                 set_tone_frequency(&tc1, CTCSS_TONES[tone_index]);
@@ -287,15 +329,25 @@ fn main() -> ! {
         last_btn_tog = tog_now;
 
         if needs_redraw && now.wrapping_sub(last_render) >= 80 {
-            display.clear().unwrap();
-            display.set_position(4, 0).unwrap();
+            ufmt::uwriteln!(&mut serial, "REDRAWING").unwrap();
+            let r = display.clear();
+            ufmt::uwriteln!(&mut serial, "display.clear={:?}", r.is_ok()).ok();
+            let r = display.set_position(4, 0);
+            ufmt::uwriteln!(&mut serial, "display.set_position={:?}", r.is_ok()).ok();
             write!(display, "  CTCSS Tone  ").ok();
+            ufmt::uwriteln!(&mut serial, "Cleared & header written").unwrap();
 
             let mut fbuf = [0u8; 8];
             let flen = fmt_dhz(&mut fbuf, CTCSS_TONES[tone_index]);
             let freq_str = core::str::from_utf8(&fbuf[..flen]).unwrap_or("???");
-            display.set_position(3, 3).unwrap();
+            let r = display.set_position(3, 3);
             write!(display, "{}", freq_str).ok();
+            ufmt::uwriteln!(
+                &mut serial,
+                "Tone freq written, display.set_position={:?}",
+                r.is_ok(),
+            )
+            .ok();
 
             // Row 6 – output status
             let status = if output_on {
@@ -303,8 +355,13 @@ fn main() -> ! {
             } else {
                 "  output off   "
             };
-            display.set_position(3, 6).unwrap();
+            display.set_position(3, 6);
             write!(display, "{}", status).ok();
+            ufmt::uwriteln!(&mut serial, "Output status written").ok();
+
+            needs_redraw = false;
+            last_render = now;
+            ufmt::uwriteln!(&mut serial, "REDRAW COMPLETE").ok();
         }
     }
 }
