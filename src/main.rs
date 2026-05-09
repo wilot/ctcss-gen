@@ -8,7 +8,7 @@
 //    MCU       — ATmega328P (bare chip, ICSP programmed)
 //    Display   — 128×64 SSD1306 OLED over I2C (addr 0x3C)
 //    Encoder   — rotary encoder on PD2/PD3 (PCINT18/19)
-//    Buttons   — "Select" on PD4,  "Toggle output" on PD7
+//    Buttons   — "Select" on PD4
 //    Tone out  — OC1A  (PB1) via Timer1 CTC toggle
 //    Power     — AA batteries through a power switch
 //
@@ -16,13 +16,23 @@
 //    SDA = PC4
 //    SCL = PC5
 //
-//  Tone output (0 V – 5 V square from OC1A) must be attenuated
+//  Timers:
+//  TC0 = millisecond counter
+//  TC1 = tone generator
+//
+//  Tone output (0 V – 3.3 V square from OC1A) must be attenuated
 //  to ≤ 0.35 Vpp with a resistive divider before injecting into
 //  the FT-480R tone socket.
+//
+//  Each time a PortD input pin (i.e. from the rotary encoder)
+//  changes state, the PCINT2 interrupt is triggered. Here, the
+//  state of the rotary encoder is compared to previous to
+//  determine direction of rotation. If this input is after the
+//  debounce cooldown period, it is recorded. In the next main
+//  loop iteration, it changes the selected CTCSS tone.
 
 use core::cell::Cell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
 use panic_halt as _;
 
 use atmega_hal::usart::Baudrate;
@@ -30,7 +40,7 @@ use atmega_hal::usart::Usart;
 use avr_device::atmega328p::TC1;
 use avr_device::interrupt::Mutex;
 
-use ssd1306::{I2CDisplayInterface, Ssd1306, mode::TerminalMode, prelude::*};
+use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 // Standard CTCSS tone table (EIA/TIA)
 const CTCSS_TONES: [u16; 50] = [
@@ -42,15 +52,30 @@ const CTCSS_TONES: [u16; 50] = [
 // Shared state (interrupts & main loop)
 static ENCODER_DELTA: Mutex<Cell<i8>> = Mutex::new(Cell::new(0));
 
-static BTN_SELECT_PRESSED: AtomicBool = AtomicBool::new(false);
-static BTN_TOGGLE_PRESSED: AtomicBool = AtomicBool::new(false);
-
 static MILLIS_CTR: Mutex<Cell<u32>> = Mutex::new(Cell::new(0));
+static DEBOUNCE_CTR: Mutex<Cell<u32>> = Mutex::new(Cell::new(0)); // Time of last input
+const DEBOUNCE_COOLDOWN: u32 = 250; // Cooldown for switch inputs, in milliseconds
 
 // Helper functions
 
+/// The current calue of a millisecond counter
 fn millis() -> u32 {
     avr_device::interrupt::free(|cs| MILLIS_CTR.borrow(cs).get())
+}
+
+/// Check whether cooldown timer has elapsed. If so, resets the counter
+fn cooled_down() -> bool {
+    avr_device::interrupt::free(|cs| {
+        let now = MILLIS_CTR.borrow(cs).get();
+        let prev_time_cell = DEBOUNCE_CTR.borrow(cs);
+        let time_elapsed = now.wrapping_sub(prev_time_cell.get());
+        if time_elapsed > DEBOUNCE_COOLDOWN {
+            prev_time_cell.set(now);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn take_encoder_delta() -> i8 {
@@ -149,7 +174,7 @@ fn PCINT2() {
         _ => 0,
     };
 
-    if delta != 0 {
+    if delta != 0 && cooled_down() {
         avr_device::interrupt::free(|cs| {
             let c = ENCODER_DELTA.borrow(cs);
             //c.set(c.get().saturating_add(delta));
@@ -249,10 +274,9 @@ fn main() -> ! {
     let _tone_pin = pins.pb1.into_output();
 
     // Encoder + buttons
-    let _enc_a = pins.pd2.into_pull_up_input();
-    let _enc_b = pins.pd3.into_pull_up_input();
-    let btn_sel = pins.pd4.into_pull_up_input();
-    let btn_tog = pins.pd7.into_pull_up_input();
+    let _enc_a = pins.pd2.into_floating_input();
+    let _enc_b = pins.pd3.into_floating_input();
+    let btn_sel = pins.pd4.into_floating_input();
 
     // Timers setup
     millis_init(dp.TC0);
@@ -271,21 +295,17 @@ fn main() -> ! {
     // Application state
     let mut tone_index: usize = 12;
     let mut output_on = false;
-    let mut last_btn_sel = true;
-    let mut last_btn_tog = true;
     let mut last_render: u32 = 0;
     let mut needs_redraw = true;
 
     stop_tone(&tc1);
-
-    let mut last_encoder_delta_time = millis();
 
     // Main loop
     loop {
         let now = millis();
 
         let delta = take_encoder_delta();
-        if delta != 0 && now - last_encoder_delta_time > 200 {
+        if delta != 0 {
             ufmt::uwriteln!(&mut serial, "Updating tone").unwrap();
             let new_idx = (tone_index as i16 + delta as i16)
                 .clamp(0, (CTCSS_TONES.len() - 1) as i16) as usize;
@@ -298,16 +318,9 @@ fn main() -> ! {
             }
         }
 
-        let sel_now = btn_sel.is_high();
-        if last_btn_sel && !sel_now {
-            ufmt::uwriteln!(&mut serial, "Select pressed").unwrap();
-            BTN_SELECT_PRESSED.store(true, Ordering::SeqCst);
-        }
-        last_btn_sel = sel_now;
-
-        let tog_now = btn_tog.is_high();
-        if last_btn_tog && !tog_now {
-            ufmt::uwriteln!(&mut serial, "Output toggle").unwrap();
+        let sel_now = btn_sel.is_low() && cooled_down();
+        if sel_now {
+            ufmt::uwriteln!(&mut serial, "Toggle pressed").unwrap();
             output_on = !output_on;
             if output_on {
                 set_tone_frequency(&tc1, CTCSS_TONES[tone_index]);
@@ -316,7 +329,6 @@ fn main() -> ! {
             }
             needs_redraw = true;
         }
-        last_btn_tog = tog_now;
 
         if needs_redraw && now.wrapping_sub(last_render) >= 80 {
             ufmt::uwriteln!(&mut serial, "REDRAWING").unwrap();
